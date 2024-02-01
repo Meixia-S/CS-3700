@@ -1,0 +1,7 @@
+#!/bin/bash
+# Need classpath to be explicitly metioned to include required jar
+# files
+  CLASSPATH=.:gson-2.10.1.jar
+# Invoking the entrypoint file mainfile
+# $@ represents all the command-line arguments passed to the script when it is executed.
+  java -classpath $CLASSPATH Main "$@"
