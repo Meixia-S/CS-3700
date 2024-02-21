@@ -1,0 +1,843 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, json, select
+import sys
+
+
+class Router:
+    """
+    This is the class that describes a BGP router. The router is responsible for accepting route announcements from its
+    peers, creating new route announcements for its peers, handling a forwarding table, and forwarding data packets.
+    """
+    relations = {}
+    sockets = {}
+    ports = {}
+
+    routing_table = []
+    announcement_storage = []
+    withdraw_storage = []
+    cust = []
+    peer_prov_cust = []
+
+    def __init__(self, asn, connections):
+        """This initializes a Router object.
+
+        For each connection, the connection is sorted as a customer or peer or prov and then a UDP socket is created.
+        If there are no errors, a handshake message is sent to the neighboring connection. Any TypeError,
+        UnicodeEncodeError, or OSError is caught and the system exits.
+        :param asn: THis is the AS number for this router.
+        :param connections: These are the ports that connect this router to its neighboring routers. Within this,
+        each item has port number, IP address of the neighbor, and relationship between this router and the neighboring
+        router.
+        """
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+            if relation == "cust":
+                self.cust.append(neighbor)
+                self.peer_prov_cust.append(neighbor)
+            elif relation == "peer" or relation == "prov":
+                self.peer_prov_cust.append(neighbor)
+            try:
+                self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.sockets[neighbor].bind(('localhost', 0))
+            except OSError:
+                sys.exit()
+
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            try:
+                self.send(neighbor,
+                          json.dumps({"type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}}))
+            except TypeError:
+                sys.exit()
+            except UnicodeEncodeError:
+                sys.exit()
+            except OSError:
+                sys.exit()
+
+    def our_addr(self, dst):
+        """This retrieves our router's IP address in quad notation.
+
+        :param dst: This is the IP address of the destination of an announcement.
+        :return: This returns the IP address of our router, in quad notation.
+        """
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    def send(self, network, message):
+        """ This sends a message to a socket associated with a network.
+
+        Any TypeError, UnicodeEncodeError, or OSError is caught and the system exits.
+        :param network: This is the socket to send the message to.
+        :param message: This is the message that needs to be sent.
+        :return: n/a
+        """
+        try:
+            self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+        except TypeError:
+            sys.exit()
+        except UnicodeEncodeError:
+            sys.exit()
+        except OSError:
+            sys.exit()
+
+    def run(self):
+        """ This runs the router so that it can receive and handle update, withdraw, dump, and data messages from
+        other sockets.
+
+        It listens to multiple sockets using select(). It receives data from messages and any TypeError,
+        UnicodeEncodeError, or OSError is caught and the system exits.
+        :return: n/a
+        """
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                try:
+                    k, addr = conn.recvfrom(65535)
+                except OSError:
+                    sys.exit()
+                except TypeError:
+                    sys.exit()
+                except ValueError:
+                    sys.exit()
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+
+                msg_json = json.loads(k)
+                src = msg_json["src"]
+                dst = msg_json["dst"]
+                type_of_msg = msg_json["type"]
+                msg = msg_json["msg"]
+                announcement = Entry(src, dst, type_of_msg, msg)
+
+                if msg_json["type"] == "update":
+                    self.handle_update_msg(announcement)
+
+                if msg_json["type"] == "withdraw":
+                    self.handle_withdraw_msg(announcement)
+
+                if msg_json["type"] == "dump":
+                    self.handle_dump_msg(src, dst)
+
+                if msg_json["type"] == "data":
+                    self.handle_data_msg(announcement, srcif)
+
+                print("Received message '%s' from %s" % (msg_json, srcif))
+
+    # Handling Messages ------------------------------------------------------------------------------------------------
+    def handle_update_msg(self, entry):
+        """ This handles an update message received by our router.
+
+        It stores the message in a cache, performs aggregation on the routing table, and adds to the routing table as
+        necessary.
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :return: n/a
+        """
+        self.announcement_storage.append(entry)
+        self.aggregation_combine()
+
+        if not self.is_already_added(entry):
+            self.create_new_routing_table_entry(entry)
+        self.send_update_response(entry)
+
+    def create_new_routing_table_entry(self, entry):
+        """ This creates a new entry in the routing table for our router.
+
+        To create the routing table entry, the network, netmask, peer, localpref, ASPath, selfOrigin, and origin are
+        retrieved from a given announcement/message received.
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :return: n/a
+        """
+        network = entry.get_network()
+        netmask = entry.get_netmask()
+        peer = entry.src
+        localpref = entry.get_local_pref()
+        ASPath = entry.get_ASPath()
+        selfOrigin = entry.get_self_origin()
+        origin = entry.get_origin()
+        new_entry = {"network": network, "netmask": netmask, "peer": peer, "localpref": localpref, "ASPath": ASPath,
+                     "selfOrigin": selfOrigin, "origin": origin}
+        self.routing_table.append(new_entry)
+
+    def send_update_response(self, entry):
+        """ This sends a response to an update message that was received to specific recipients.
+
+        To send the response, the recipients that must receive the response are determined. The proper network,
+        netmask, ASPath, src, dst, and type are also determined before the response is sent to each recipient.
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :return: n/a
+        """
+        recipients = self.determine_receivers(entry)
+        network = entry.get_network()
+        netmask = entry.get_netmask()
+        entry.get_ASPath().insert(0, self.asn)
+        for r in recipients:
+            if r != entry.src:
+                update_response = json.dumps(
+                    {'msg': {'network': network, 'netmask': netmask, 'ASPath': entry.get_ASPath()},
+                     'src': self.our_addr(r), 'dst': r, 'type': "update"})
+                self.send(r, update_response)
+        entry.get_ASPath().remove(self.asn)
+
+    def handle_withdraw_msg(self, entry):
+        """ This handles the withdraw messages received by our router.
+
+        It disaggregates the routing table. It also finds the recipients that must receive a response for the withdraw
+        message received by our router. It then removes entries corresponding to withdraw messages from the routing
+        table before aggregating the routing table.
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :return: n/a
+        """
+        self.disaggregation()
+        self.withdraw_storage.append(entry)
+        recipients = self.determine_receivers(entry)
+
+        for r in recipients:
+            if r != entry.src:
+                withdraw_response = json.dumps(
+                    {"src": self.our_addr(r), "dst": r, "type": "withdraw", "msg": entry.msg})
+                self.send(r, withdraw_response)
+
+        self.finding_removable_entries(entry)
+        self.aggregation_combine()
+
+    def finding_removable_entries(self, entry):
+        """ Given an Entry object, this determines which entries should be removed from the routing table and then
+        removes them.
+
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :return: n/a
+        """
+        entries_to_remove = []
+
+        routing_table_len = len(self.routing_table)
+        for i in range(len(entry.msg)):
+            for j in range(routing_table_len):
+                if (self.routing_table[j]["peer"] == entry.src and
+                        self.routing_table[j]["network"] == entry.msg[i]["network"] and
+                        self.routing_table[j]["netmask"] == entry.msg[i]["netmask"]):
+                    entries_to_remove.append(self.routing_table[j])
+
+        for entry in entries_to_remove:
+            self.routing_table.remove(entry)
+
+    def handle_dump_msg(self, src, dst):
+        ''' This handles a dump message received by sending a table type response back that contains the routing table.
+
+        :param src: This is the source IP address (i.e. our router), who is sending the table type response.
+        :param dst: This is the destination IP address to which the table type response must be sent to.
+        :return: n/a
+        '''
+        table_response = {"src": dst, "dst": src, "type": "table", "msg": self.routing_table}
+        self.send(src, json.dumps(table_response))
+
+    def handle_data_msg(self, entry, srcif):
+        """ This handles a received data message.
+
+        It finds routes to "dst" in order to forward the data packet and returns a "no route" message if there is no
+        known route(s). If multiple routes are found, the one with the longest prefix match wins. If there are still
+        multiple routes after prefix matching, the packet is forwarded to the one that wins a tie-breaker.
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :return: n/a
+        """
+        possible_recipients = []
+        possible_recipients_and_result = []
+
+        for item in self.routing_table:
+            self.valid_data_recipients(entry, item, possible_recipients, possible_recipients_and_result)
+
+        if len(possible_recipients) == 1:
+            self.one_recipient_scenario(entry, srcif, possible_recipients)
+
+        elif len(possible_recipients) > 1:
+            possible_recipients_same_network = self.longest_pref_match(entry.dst, possible_recipients,
+                                                                       possible_recipients_and_result)
+            if len(possible_recipients_same_network) == 1:
+                self.one_recipient_pref_match_scenario(entry, srcif, possible_recipients_same_network)
+
+            elif len(possible_recipients_same_network) > 1:
+                self.tie_breaker_scenario(entry, srcif, possible_recipients_same_network)
+            else:
+                self.send_data_msg(entry, "no route", srcif)
+        else:
+            self.send_data_msg(entry, "no route", srcif)
+
+    def one_recipient_scenario(self, entry, srcif, possible_recipients):
+        """ This handles forwarding a data packet when there is only one possible recipient.
+
+        It checks if the packet can be forwarded legally and if so, it forwards the data packet. Otherwise, it sends
+        a "no route" message.
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :param srcif: This is the IP address of the source that send the data to our router.
+        :param possible_recipients: This is a list of all the possible recipients that a data packet can be forwarded to.
+        :return: n/a
+        """
+        recipient = possible_recipients[0]["peer"]
+
+        if self.is_legal(srcif, recipient):
+            self.send_data_msg(entry, "data", recipient)
+        else:
+            self.send_data_msg(entry, "no route", recipient)
+
+    def one_recipient_pref_match_scenario(self, entry, srcif, possible_recipients_same_network):
+        """ This handles forwarding a data packet when there is only one possible recipient after longest prefix
+        matching has been completed.
+
+        It checks if the packet can be forwarded legally and if so, it forwards the data packet. Otherwise, it sends
+        a "no route" message.
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :param srcif: This is the IP address of the source that send the data to our router.
+        :param possible_recipients_same_network: This is a list of all the possible recipients that a data packet
+        can be forwarded to after longest prefix matching has filtered out other potential recipients. In this scenario,
+        the list contains only one recipient.
+        :return: n/a
+        """
+        recipient = possible_recipients_same_network[0]["peer"]
+
+        if self.is_legal(srcif, recipient):
+            self.send_data_msg(entry, "data", recipient)
+        else:
+            self.send_data_msg(entry, "no route", srcif)
+
+    def tie_breaker_scenario(self, entry, srcif, possible_recipients_same_network):
+        """ This handles forwarding a data packet when there are more than one possible recipients after longest prefix
+        matching has been completed. Tie breaking must occur between the possible recipients to determine the actual
+        recipient.
+
+        It checks if the packet can be forwarded legally and if so, it forwards the data packet. Otherwise, it sends
+        a "no route" message.
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :param srcif: This is the IP address of the source that send the data to our router.
+        :param possible_recipients_same_network: This is all the possible recipients that a data packet
+        can be forwarded to after longest prefix matching has filtered out other potential recipients. In this scenario,
+        the list contains multiple recipients.
+        :return: n/a
+        """
+        recipient_test_list = self.break_tie_helper(possible_recipients_same_network)
+        recipient = recipient_test_list[0]["peer"]
+
+        if self.is_legal(srcif, recipient):
+            self.send_data_msg(entry, "data", recipient)
+        else:
+            self.send_data_msg(entry, "no route", srcif)
+
+    def send_data_msg(self, entry, type_of_msg, recipient):
+        """ This handles sending a response when a data message is recieved.
+
+        This handles either sending forwarding of a data packet or sending a "no route" message to the recipient.
+        If the type_of_msg is "data", the data packet is fowarded. If the type_of_msg is "no route", a "no route"
+        message is sent.
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :param type_of_msg: This is the type of the message to be sent, either "data" or "no route".
+        :param recipient: This is the recipient of the response to the data packet our router received.
+        :return: n/a
+        """
+        if type_of_msg == "data":
+            data_response = {"src": entry.src, "dst": entry.dst, "type": "data", "msg": entry.msg}
+            self.send(recipient, json.dumps(data_response))
+        else:
+            no_route_response = {"src": entry.src, "dst": entry.dst, "type": "no route", "msg": {}}
+            self.send(recipient, json.dumps(no_route_response))
+
+    def is_legal(self, src, dst):
+        """ This checks the relationship between the source and destination of a data packet to determine
+        if a data packet can be forwarded legally.
+
+        If either the src or the dest is a peer or prov, the packet is dropped. If either is a customer, our
+        router forwards the data.
+        :param src: This is the IP address of the source that sent the data to our router.
+        :param dst: This is the IP address of the destination that is receiving the data packet.
+        :return: n/a
+        """
+        if self.relations[src] == "cust" or self.relations[dst] == "cust":
+            return True
+        elif self.relations[src] in ["peer", "prov"] or self.relations[dst] in ["peer", "prov"]:
+            return False
+
+    # Scenario 3 and 4 Data Messages -----------------------------------------------------------------------------------
+    def valid_data_recipients(self, entry, item, possible_recipients, possible_recipients_and_result):
+        """ This determines the valid recipients of a response from our router.
+
+        Determining recipients is based on the result of applying the subnet mask to a network for a given routing table
+        item and then comparing it to the result of applying the subnet mask to the destination of the entry our router
+        received. If they are the same, the item in the routing table is a possible recipient.
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :param item: This is an item from the routing table.
+        :param possible_recipients: This is a list of all the possible recipients that our router can send a response to.
+        :param possible_recipients_and_result: This is a list of the result of applying a subnet mask to a network for
+        the given item.
+        :return: n/a
+        """
+        network_and_netmask_result = self.apply_subnet_mask(item["network"], item["netmask"])
+        dst_and_netmask_result = self.apply_subnet_mask(entry.dst, item["netmask"])
+        counter = 0
+
+        for i in range(len(dst_and_netmask_result)):
+            if dst_and_netmask_result[i] == network_and_netmask_result[i]:
+                counter += 1
+        if counter == 4:
+            possible_recipients.append(item)
+            possible_recipients_and_result.append(network_and_netmask_result)
+
+    def longest_pref_match(self, dest, possible_recipients, possible_recipients_and_result):
+        """ This performs longest prefix matching on all possible recipients to determine which possible recipient
+        has the longest prefix match to the destination of a data packet.
+
+        :param dest: This is the destination of the received data packet.
+        :param possible_recipients: This is a list of all the possible recipients to whom our router could forward
+        the data packet to.
+        :param possible_recipients_and_result: This is a list of the result of applying a subnet mask to each possible
+        recipient.
+        :return: This returns a list of all the recipients that had the longest prefix match to the given destination.
+        """
+        greatest_match = 0
+        longest_prefix_recipients_list = []
+
+        for i in range(len(possible_recipients_and_result)):
+            recipient = possible_recipients[i]
+            dest_split = dest.split(".")
+            counter = 0
+
+            for j in range(len(possible_recipients_and_result[i])):
+                if int(dest_split[j]) == possible_recipients_and_result[i][j]:
+                    counter += 1
+                if j == 3 and recipient not in longest_prefix_recipients_list:
+                    if counter > greatest_match and counter != 0:
+                        greatest_match = counter
+                        longest_prefix_recipients_list.clear()
+                        longest_prefix_recipients_list.append(recipient)
+                    elif counter == greatest_match and counter != 0:
+                        longest_prefix_recipients_list.append(recipient)
+
+        return longest_prefix_recipients_list
+
+    def apply_subnet_mask(self, network_or_dst, netmask):
+        """ This applies a subnet mask to a network or destination. It performs the bitwise "&" operation to apply the
+        mask.
+
+        :param network_or_dst: This is the network or destination address to which the netmask must be applied to.
+        :param netmask: This is the netmask to be applied.
+        :return: This returns a list of "quads" of an address after the subnet mask has been applied to the given
+        network or destination.
+        """
+        split_network_or_dst = network_or_dst.split(".")
+        split_netmask = netmask.split(".")
+        network_or_dst_netmask_and = []
+
+        for i in range(len(split_netmask)):
+            quad_and = int(split_netmask[i]) & int(split_network_or_dst[i])
+            network_or_dst_netmask_and.append(quad_and)
+
+        return network_or_dst_netmask_and
+
+    # Tie Breaker Functions --------------------------------------------------------------------------------------------
+    def break_tie_helper(self, same_network_recipient_routing_table):
+        """ This handles breaking a tie when there are multiple recipients who a data packet can be forwarded to,
+        after longest prefix matching has been completed.
+
+        The tie is broken based on the entry with the highest localpref, with true for selfOrigin, with the shortest
+        ASPath, with the best origin (i.e. IGP > EGP > UNK), with the lowest IP address from the neighbor router.
+        :param same_network_recipient_routing_table: This is the entries in the routing table that are possible
+        recipients after longest prefix matching has been completed.
+        :return: This returns the recipient that won the tiebreaker.
+        """
+        recipients = self.compare_localpref(same_network_recipient_routing_table)
+        if len(recipients) == 1:
+            return recipients
+
+        recipients = self.compare_selfOrigin(recipients)
+        if len(recipients) == 1:
+            return recipients
+
+        recipients = self.compare_ASPath(recipients)
+        if len(recipients) == 1:
+            return recipients
+
+        recipients = self.compare_Origin(recipients)
+        if len(recipients) == 1:
+            return recipients
+
+        recipients = self.compare_peer(recipients)
+        if len(recipients) == 1:
+            return recipients
+
+    def compare_localpref(self, same_network_recipient_routing_table):
+        """ This compares the localpref of all possible recipients given, to determine the ones with the highest
+        localpref.
+
+        :param same_network_recipient_routing_table: This is the entries in the routing table that are possible
+        recipients after longest prefix matching has been completed.
+        :return: This returns the entries in the routing table with the greatest localpref as the possible recipients.
+        """
+        maxValue = 0
+        result = []
+
+        for i in range(len(same_network_recipient_routing_table)):
+            if same_network_recipient_routing_table[i]["localpref"] > maxValue:
+                maxValue = same_network_recipient_routing_table[i]["localpref"]
+                result.clear()
+                result.append(same_network_recipient_routing_table[i])
+            elif same_network_recipient_routing_table[i]["localpref"] == maxValue:
+                result.append(same_network_recipient_routing_table[i])
+
+        return result
+
+    def compare_selfOrigin(self, same_network_recipient_routing_table):
+        """ This compares the selfOrigin of all possible recipients given, to determine the ones with true
+        for selfOrigin.
+
+        :param same_network_recipient_routing_table: This is the entries in the routing table that are possible
+        recipients after comparing localpref has been completed.
+        :return: This returns the entries in the routing table with true for selfOrigin as the possible recipients.
+        """
+        result = []
+
+        for i in range(len(same_network_recipient_routing_table)):
+            if same_network_recipient_routing_table[i]["selfOrigin"] is True:
+                result.append(same_network_recipient_routing_table[i])
+        if len(result) == 0:
+            return same_network_recipient_routing_table
+
+        return result
+
+    def compare_ASPath(self, same_network_recipient_routing_table):
+        """ This compares the ASPath of all possible recipients given, to determine the ones with the longest ASPath.
+
+        :param same_network_recipient_routing_table: This is the entries in the routing table that are possible
+        recipients after comparing selfOrigin has been completed.
+        :return: This returns the entries in the routing table with the longest ASPath as the possible recipients.
+        """
+        minValue = len(same_network_recipient_routing_table[0]["ASPath"])
+        result = []
+
+        for i in range(len(same_network_recipient_routing_table)):
+            if len(same_network_recipient_routing_table[i]["ASPath"]) < minValue:
+                minValue = len(same_network_recipient_routing_table[i]["ASPath"])
+                result.clear()
+                result.append(same_network_recipient_routing_table[i])
+            elif len(same_network_recipient_routing_table[i]["ASPath"]) == minValue:
+                result.append(same_network_recipient_routing_table[i])
+
+        return result
+
+    def compare_Origin(self, same_network_recipient_routing_table):
+        """ This compares the origin of all possible recipients given, to determine the ones with the the best orgin
+        (i.e. IGP > EGP > UNK).
+
+        :param same_network_recipient_routing_table: This is the entries in the routing table that are possible
+        recipients after comparing ASPath has been completed.
+        :return: This returns the entries in the routing table with the best origin as the possible recipients.
+        """
+        IGP, EGP, UNK = [], [], []
+
+        for i in range(len(same_network_recipient_routing_table)):
+            if same_network_recipient_routing_table[i]["origin"] == "IGP":
+                IGP.append(same_network_recipient_routing_table[i])
+            elif same_network_recipient_routing_table[i]["origin"] == "EGP":
+                EGP.append(same_network_recipient_routing_table[i])
+            else:
+                UNK.append(same_network_recipient_routing_table[i])
+
+        if len(IGP) > 0:
+            return IGP
+        elif len(EGP) > 0:
+            return EGP
+        else:
+            return UNK
+
+    def compare_peer(self, same_network_recipient_routing_table):
+        """ This compares the peer of all possible recipients given, to determine the entry coming from the neighbor
+        router with the lowest IP address.
+
+        :param same_network_recipient_routing_table: This is the entries in the routing table that are possible
+        recipients after comparing origin has been completed.
+        :return: This returns the entries in the routing table with the lowest IP address for the peer field as the
+        possible recipient.
+        """
+        minValue = [255, 255, 255, 255]
+        result = []
+
+        for i in range(len(same_network_recipient_routing_table)):
+            peer_split_list_str = same_network_recipient_routing_table[i]["peer"].split(".")
+            peer_split_list_ints = []
+
+            for quad in peer_split_list_str:
+                peer_split_list_ints.append(int(quad))
+
+            for j in range(len(minValue)):
+                if peer_split_list_ints[j] < minValue[j]:
+                    result.clear()
+                    result.append(same_network_recipient_routing_table[i])
+                    minValue = peer_split_list_ints
+
+        return result
+
+    # Aggregation Functions --------------------------------------------------------------------------------------------
+    def aggregation_combine(self):
+        """ This performs aggregation to combine entries in the routing table.
+
+        Aggregation is completed based on if two entries are numerically adjacent, forward to the same router in the
+        next-hop, and have the same network, netmask, peer, localpref, ASPath, selfOrigin, and origin.
+        :return: n/a
+        """
+        all_entries = self.conversion_to_dict()
+        entries_keys = list(all_entries.keys())
+        entries_keys.sort()
+
+        for i in range(len(entries_keys)):
+            if i + 1 in range(len(entries_keys)):
+                entry_value_i = all_entries[entries_keys[i]]
+                entry_value_plus_one = all_entries[entries_keys[i + 1]]
+
+                if self.has_same_attributes(entry_value_i, entry_value_plus_one):
+                    new_entry = {"network": entry_value_i["network"],
+                                 "netmask": self.bit_shift_netmask(entry_value_i),
+                                 "peer": entry_value_i["peer"], "localpref": entry_value_i["localpref"],
+                                 "ASPath": entry_value_i["ASPath"], "selfOrigin": entry_value_i["selfOrigin"],
+                                 "origin": entry_value_i["origin"]}
+                    self.routing_table.append(new_entry)
+                    self.routing_table.remove(entry_value_i)
+                    self.routing_table.remove(entry_value_plus_one)
+
+    def bit_shift_netmask(self, entry):
+        """ This shifts a given entry's netmask by one bit to make it one bit smaller.
+
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :return: This returns the updated netmask after it has been shortened by one bit.
+        """
+        split_entry = entry["netmask"].split(".")
+        updated_entry = []
+        is_first_one = True
+        counter = 0
+        i = len(split_entry) - 1
+
+        while i >= 0:
+            quad = split_entry[i]
+            quad_binary = bin(int(quad)).zfill(8)
+            if "1" in quad_binary and is_first_one:
+                is_first_one = False
+                quad = int(quad) - 1
+                updated_entry = [str(quad)] + updated_entry
+            else:
+                updated_entry = [str(quad)] + updated_entry
+            counter += 1
+            i -= 1
+
+        return ".".join(updated_entry)
+
+    def has_same_attributes(self, entry_one, entry_two):
+        """ This compares two entries based on their localpref, selfOrigin, ASPath, origin, peer, and whether their
+        networks are one bit off from one another.
+
+        :param entry_one: This is an Entry object, that represents key information about an announcement/message received.
+        It is compared to another Entry object.
+        :param entry_two: This is an Entry object, that represents key information about an announcement/message received.
+        It is compared to another Entry object.
+        :return: This returns True if both entries have the same attributes and have networks that are numerically
+        adjacent. Else, it returns False.
+        """
+        compare_localpref = entry_one["localpref"] == entry_two["localpref"]
+        compare_selfOrigin = entry_one["selfOrigin"] == entry_two["selfOrigin"]
+        compare_ASPath = entry_one["ASPath"] == entry_two["ASPath"]
+        compare_Origin = entry_one["origin"] == entry_two["origin"]
+        compare_peer = entry_one["peer"] == entry_two["peer"]
+
+        return self.is_one_bit_off(
+            entry_one,
+            entry_two) and compare_localpref and compare_selfOrigin and compare_ASPath and compare_Origin and compare_peer
+
+    def is_one_bit_off(self, entry_one, entry_two):
+        """ This compares the network of two given entries and checks if they are adjacent to one another numerically by
+        comparing their networks in binary.
+
+        :param entry_one: This is an Entry object, that represents key information about an announcement/message received.
+        It is compared to another Entry object.
+        :param entry_two: This is an Entry object, that represents key information about an announcement/message received.
+        It is compared to another Entry object.
+        :return: This returns True if the entries are one bit apart from one another, else it returns False.
+        """
+        split_entry_one = entry_one["network"].split(".")
+        split_entry_two = entry_two["network"].split(".")
+        is_first_one = True
+        i = len(split_entry_one) - 1
+
+        while i >= 0:
+            quad_entry_one = split_entry_one[i]
+            quad_entry_two = split_entry_two[i]
+            quad_binary_one = bin(int(quad_entry_one)).zfill(8)
+            quad_binary_two = bin(int(quad_entry_two)).zfill(8)
+
+            if "1" in quad_binary_one and is_first_one:
+                is_first_one = False
+
+                for j in range(len(quad_binary_one)):
+                    if quad_binary_one[j] != quad_binary_two[j] and j < 7:
+                        return False
+            i -= 1
+
+        return True
+
+    def conversion_to_dict(self):
+        """ This applies the subnet mask to all items in the routing table and appends each item in the routing table
+        to an entries dictionary where the key is the sum of the result of applying the subnet mask to the network to a
+        dictionary.
+
+        :return: This returns teh entries dictionary that is created via the process described above.
+        """
+        entries = {}
+
+        for i in range(len(self.routing_table)):
+            and_result = self.apply_subnet_mask(self.routing_table[i]["network"],
+                                                self.routing_table[i]["netmask"])
+            sum_of_and_result = sum(and_result)
+            entries[sum_of_and_result] = self.routing_table[i]
+
+        return entries
+
+    def disaggregation(self):
+        """ This performs disaggregation of the routing table.
+
+       The disaggregation is performed by clearing the routing table, removing all the withdraw messages received thus far
+       from the announcement cache, then building up the routing table with only the announcements remaining in the cache.
+        :return: n/a
+        """
+        self.routing_table.clear()
+        withdraw_msg_list = []
+        entries_to_remove = []
+
+        for i in range(len(self.withdraw_storage)):
+            for item in self.withdraw_storage[i].msg:
+                withdraw_msg_list.append(item)
+
+        for i in range(len(withdraw_msg_list)):
+            for j in range(len(self.announcement_storage)):
+                if (self.announcement_storage[j].get_network() == withdraw_msg_list[i]["network"] and
+                        self.announcement_storage[j].get_netmask() == withdraw_msg_list[i]["netmask"]):
+                    entries_to_remove.append(self.announcement_storage[j])
+
+        for entry in entries_to_remove:
+            self.announcement_storage.remove(entry)
+
+        for announcement in self.announcement_storage:
+            if not self.is_already_added(announcement):
+                self.create_new_routing_table_entry(announcement)
+
+    # Mini Helpers -----------------------------------------------------------------------------------------------------
+    def is_already_added(self, entry):
+        """ This checks whether an entry is already in the routing table.
+
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :return: If an entry is in the routing table, True is returned, else False.
+        """
+        for item in self.routing_table:
+            if (item["network"] == entry.get_network() and item["netmask"] == entry.get_netmask() and
+                    item["ASPath"] == entry.get_ASPath()):
+                return True
+        return False
+
+    def determine_receivers(self, entry):
+        """ Given a received message, this determines the potential receivers of a response based on whether the src of
+        message is a customer or not.
+
+        :param entry: This is an Entry object, that represents key information about an announcement/message received.
+        :return: This returns a list of customers or a list of peers, provs, and customers, depending on whether the
+        source of the received message is a customer or not.
+        """
+        if entry.src in self.cust:
+            return self.peer_prov_cust
+        else:
+            return self.cust
+
+
+# Entry Class ----------------------------------------------------------------------------------------------------------
+class Entry:
+    def __init__(self, src, dst, type_of_msg, msg):
+        """ This initializes an Entry object, which represents an announcement received by the router.
+
+        :param src: This is the source IP address of the announcement.
+        :param dst: This is the destination IP address of the announcement.
+        :param type_of_msg: This is the type of the announcement.
+        :param msg: This is the message contained in the announcement.
+        """
+        self.src = src
+        self.dst = dst
+        self.type_of_msg = type_of_msg
+        self.msg = msg
+
+    # getters
+    def get_network(self):
+        """ This gets the network of the Entry object.
+
+        :return: This returns the network of the Entry object.
+        """
+        network = self.msg["network"]
+        return network
+
+    def get_netmask(self):
+        """ This gets the netmask of the Entry object.
+
+        :return: This returns the netmask of the Entry object.
+        """
+        netmask = self.msg["netmask"]
+        return netmask
+
+    def get_local_pref(self):
+        """ This gets the localpref of the Entry object.
+
+        :return: This returns the localpref of the Entry object.
+        """
+        localpref = self.msg["localpref"]
+        return localpref
+
+    def get_self_origin(self):
+        """ This gets the selfOrigin of the Entry object.
+
+        :return: This returns the selfOrigin of the Entry object.
+        """
+        selfOrigin = self.msg["selfOrigin"]
+        return selfOrigin
+
+    def get_ASPath(self):
+        """ This gets the ASPath of the Entry object.
+
+        :return: This returns the ASPath of the Entry object.
+        """
+        ASPath = self.msg["ASPath"]
+        return ASPath
+
+    def get_origin(self):
+        """ This gets the origin of the Entry object.
+
+        :return: This returns the origin of the Entry object.
+        """
+        origin = self.msg["origin"]
+        return origin
+
+    def get_peer(self):
+        """ This gets the peer of the Entry object.
+
+        :return: This returns the peer of the Entry object.
+        """
+        peer = self.msg["peer"]
+        return peer
+
+
+# Main Function --------------------------------------------------------------------------------------------------------
+if __name__ == "__main__":
+    # This is the main function that parses our arguments and then runs our router.
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    try:
+        args = parser.parse_args()
+    except argparse.ArgumentError:
+        sys.exit()
+    router = Router(args.asn, args.connections)
+    router.run()
