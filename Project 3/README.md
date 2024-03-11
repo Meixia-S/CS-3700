@@ -92,15 +92,15 @@ Disaggregation
     did and how they all fit together.
     - Our comments also helped in our efforts to make our code easily readable.
 <pre>Testing: 
-
+   
     In our past projects, our primary method of testing code involved utilizing print statements for 
     debugging purposes after executing the provided configuration test files. We placed significant 
     reliance on the feedback generated during test runs, particularly focusing on error codes. By 
     meticulously comparing these messages with the outputs of our data representations (such as 
     self.routing_tables and self.announcement_storage), we were able to identify bugs within our code 
-    and uncovering previously overlooked edge cases. It's worth noting that we executed the code on both 
-    our local environments and on the Khoury VM to ensure consistent performance across different setups.
-    add a line about try excepts to catch errors for sending and receving messages.
+    and uncovering previously overlooked edge cases. We also used try excepts to catch errors that
+    occur sending and receving messages. It's worth noting that we executed the code on both our local
+    environments and on the Khoury VM to ensure consistent performance across different setups.
 </pre>
 
 // Link to repo for better formatting: https://github.khoury.northeastern.edu/sindelar/3700-3
