@@ -1,0 +1,266 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+import hashlib
+
+DATA_SIZE = 1375
+
+
+class Sender:
+    """
+    This is the class that describes a sender in a sender/receiver relationship in a reliable transport protocol.
+    It is responsible for sending messages to the Receiver and handling the Acks received from the Receiver.
+    It deals with retransmitting lost packets and checking whether the Acks it is receiving are corrupted. The Sender
+    implements slow start to control the window size (by growing and shrinking it appropriately).
+    """
+    ss_thresh = 10
+    congestion_window = 2
+    acks_received = []
+    msgs_not_acked = []
+    msg_timestamp = {}
+
+    def __init__(self, host, port):
+        """
+        This initializes a Sender object. It sets the host to the given host and starts up by using a given port.
+        It creates a socket and binds it to a UDP port. It can now start sending messages to the Receiver.
+        :param host: The Receiver host to communicate with.
+        :param port: The port number of the Receiver.
+        """
+        self.host = host
+        self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.waiting = False
+
+    def log(self, message):
+        """ This writes the given message in sys.stderr and then flushes.
+
+        :param message: The message to be logged.
+        :return: N/A
+        """
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, message):
+        """ This sends a given message to a recv host over its UDP port by dumping and encoding it.
+
+        :param message: The message that needs to be sent.
+        :return: N/A
+        """
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.host, self.remote_port))
+
+    def run(self):
+        """
+        This runs the sender and has 3 main functionalities:
+            1) Receives msgs from the simulator and sends it to the Receiver (3700recv)
+            2) Receives ack messages from the Receiver and checks them for corruption
+            3) Retransmits messages if the ack message is corrupted or if a packet has been dropped
+
+        :return: N/A
+        """
+        old_rtt = 1.0
+        new_sample = 1.0
+        sequence_number_counter = 0
+        while True:
+            sockets = [self.socket, sys.stdin] if not self.waiting else [self.socket]
+            socks = select.select(sockets, [], [], 0.1)[0]
+
+            for conn in socks:
+                if conn == self.socket:
+                    try:
+                        k, addr = conn.recvfrom(65535)
+                        msg = json.loads(k)
+
+                        if self.check_corruption(msg):
+                            if msg["pk_num"] not in self.acks_received and msg["pk_num"] in self.msgs_not_acked:
+                                self.handle_receiving_ack(msg)
+                                self.grow_window_size()
+                                new_sample = time.time() - self.msg_timestamp.get(msg["pk_num"])[1]
+                    except OSError:
+                        continue
+                    except TypeError:
+                        continue
+                    except ValueError:
+                        continue
+
+                elif conn == sys.stdin:
+                    data = sys.stdin.read(DATA_SIZE)
+
+                    if len(data) == 0:
+                        if len(self.msgs_not_acked) == 0:
+                            self.log("All done!")
+                            sys.exit(0)
+                        else:
+                            self.waiting = True
+
+                    elif len(data) != 0:
+                        if sequence_number_counter not in self.msgs_not_acked:
+                            self.handle_sending_msg(data, sequence_number_counter)
+                            sequence_number_counter += 1
+
+                            if self.congestion_window <= len(self.msgs_not_acked):
+                                self.waiting = True
+
+            for packet_number in self.msgs_not_acked:
+                msg = self.msg_timestamp.get(packet_number)[0]
+                passed_time_since_msg_sent, new_rtt, timeout_limit = self.calculate_rtt_and_timeout(new_sample, old_rtt,
+                                                                                                    packet_number)
+                if passed_time_since_msg_sent > timeout_limit:
+                    old_rtt = self.retransmit_msg(msg, new_rtt, packet_number)
+
+    def retransmit_msg(self, msg, new_rtt, packet_number):
+        """
+        This retransmits the given JSON msg to the Receiver, updates the timestamp associated with the msg, shrinks the
+        window, and updates the old_rtt value by returning it.
+
+        :param msg: The JSON msg we are retransmitting.
+        :param new_rtt: The latest calculated rtt value.
+        :param packet_number: The packet number of the message to be retransmitted.
+        :return: The new old_rtt value called new_rtt.
+        """
+        self.log_and_send_msg(msg)
+        self.msg_timestamp.get(packet_number)[1] = time.time()
+        self.shrink_window_size()
+        return new_rtt
+
+    def handle_sending_msg(self, data, sequence_number_counter):
+        """
+        This creates a new JSON msg, sends and logs it, stores it in a dictionary, and appends it to an array that
+        tracks which messages have not received an Ack msg.
+
+        :param data: the content of the Json msg
+        :param sequence_number_counter: the packet number that will be associated with this data
+        :return: N/A
+        """
+        msg = {"data": data, "pk_num": sequence_number_counter}
+        msg_with_checksum = self.create_checksum_msg(msg)
+        self.log_and_send_msg(msg_with_checksum)
+        self.msg_timestamp[sequence_number_counter] = [msg, time.time()]
+        self.msgs_not_acked.append(sequence_number_counter)
+
+    def handle_receiving_ack(self, msg):
+        """ This handles the receiving a given ack msg by logging it, updating variables, and setting waiting to False.
+
+        :param msg: The JSON msg that is going to be logged.
+        :return: N/A
+        """
+        self.log("Received message '%s'" % msg)
+        self.acks_received.append(msg["pk_num"])
+        self.msgs_not_acked.remove(msg["pk_num"])
+        self.waiting = False
+
+    def calculate_rtt_and_timeout(self, new_sample, old_rtt, packet_number):
+        """ This estimates the rtt and determines the timeout as 2 times the estimated rtt.
+
+        :param new_sample: The latest calculated RTT time.
+        :param old_rtt: The value of the second latest calculated RTT time (starts off as 1).
+        :param packet_number: The packet number associated with the JSON msg.
+        :return: The time passed since a message was sent, estimated rtt, and timeout limit.
+        """
+        new_rtt = (0.875 * old_rtt) + (0.125 * new_sample)
+        passed_time_since_msg_sent = time.time() - self.msg_timestamp.get(packet_number)[1]
+        timeout_limit = 2.0 * new_rtt
+        return passed_time_since_msg_sent, new_rtt, timeout_limit
+
+    def log_and_send_msg(self, msg):
+        """ This logs and send a given JSON msg to the Receiver.
+
+        :param msg: The Json msg that is to be logged and sent to the Receiver.
+        :return: N/A
+        """
+        self.log("Sending message '%s'" % msg)
+        self.send(msg)
+
+    def shrink_window_size(self):
+        """
+        This decreases the congestion window size to 1 and the slow start threshold value to half the congestion
+        window size.
+
+        :return: N/A
+        """
+        self.ss_thresh = self.congestion_window / 2
+        self.congestion_window = 2
+
+    def grow_window_size(self):
+        """
+        This determines to what extent the congestion window should grow. It increases the congestion_window global
+        variable value/size.
+
+        :return: N/A
+        """
+        if self.congestion_window < self.ss_thresh:
+            self.congestion_window += 1
+        else:
+            self.congestion_window += (1 / self.congestion_window)
+
+    def check_key_values(self, msg):
+        """ This checks to see if the given JSON msg has the "checksum" key in it.
+
+        :param msg: The JSON msg to be checks.
+        :return: True if there is a "checksum" key in it and False if there is not.
+        """
+        list_of_keys = list(msg.keys())
+        if "checksum" not in list_of_keys:
+            return False
+        else:
+            return True
+
+    def check_corruption(self, msg):
+        """
+        This checks to see if an ack msg is corrupted by comparing the stored checksum with one generated after
+        receiving it from the Receiver. The checksum is generated via hashlib's md5 method.
+
+        :param msg: The ack msg to be checked for corruption.
+        :return: True if it is NOT corrupted and False if it is corrupted.
+        """
+        if not self.check_key_values(msg):
+            return False
+
+        checksum_from_sender = msg["checksum"]
+        del msg["checksum"]
+        msg_string = self.dump_json(msg)
+        checksum_from_receiver = hashlib.md5(msg_string.encode('utf-8')).hexdigest()
+
+        if checksum_from_sender == checksum_from_receiver:
+            msg["checksum"] = checksum_from_sender
+            return True
+        else:
+            return False
+
+    def create_checksum_msg(self, msg):
+        """ This creates a checksum for the given JSON msg.
+
+        :param msg: The Json msg to create a unique checksum value for.
+        :return: The given msg with its checksum stored as "checksum" key value pair.
+        """
+        msg_string = self.dump_json(msg)
+        checksum = hashlib.md5(msg_string.encode('utf-8')).hexdigest()
+        msg["checksum"] = checksum
+        return msg
+
+    def dump_json(self, msg):
+        """ This attempts to dump a given JSON msg into formatted string. If it fails, the program exits.
+
+        :param msg: The JSON msg to be dumped into a formatted string.
+        :return: The JSON msg in a String format
+        """
+        try:
+            msg_string = json.dumps(msg)
+            return msg_string
+        except OSError:
+            sys.exit()
+        except TypeError:
+            sys.exit()
+        except ValueError:
+            sys.exit()
+
+
+if __name__ == "__main__":
+    # This is the main function on the Sender's side.
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()

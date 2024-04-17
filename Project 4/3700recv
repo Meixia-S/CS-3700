@@ -1,0 +1,197 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+import hashlib
+
+
+class Receiver:
+    """
+    This is the class that describes a receiver in a sender/receiver relationship in a reliable transport protocol.
+    It is responsible for receiving messages from the Sender and responding with an appropriate ack for each message
+    packet it receives. It deals with receiving out of order packets, duplicate packets, corrupted packets, and
+    resending lost ack messages.
+    """
+
+    recv_buffer = {}
+    msgs_received = []
+    sequence_number_counter = 0
+
+    def __init__(self):
+        """
+        This initializes a Receiver object. It creates a socket and binds it to a UDP port. The host and port are
+        initialized as None.
+        """
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+
+        self.remote_host = None
+        self.remote_port = None
+
+    def log(self, message):
+        """ This writes the given message in sys.stderr and then flushes.
+
+        :param message: the message we are logging
+        :return: N/A
+        """
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, message):
+        """ This sends a given message to a recv host over its UDP port by dumping and encoding it.
+
+        :param message: The message that needs to be sent.
+        :return: N/A
+        """
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.remote_host, self.remote_port))
+
+    def run(self):
+        """
+        This runs the receiver and has 3 main functionalities:
+            1) Receives messages from the Sender and responds to them with the appropriate ack.
+            2) It checks the messages it receives for corruption.
+            3) It determines if an ack needs to be resent based on whether it receives a message from the sender again.
+   
+        :return: N/A
+        """
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+            for conn in socks:
+
+                try:
+                    data, addr = conn.recvfrom(65535)
+
+                    if self.remote_host is None:
+                        self.remote_host = addr[0]
+                        self.remote_port = addr[1]
+
+                    msg = json.loads(data)
+
+                    if self.check_corruption(msg) and msg["pk_num"] not in self.msgs_received:
+                        # indicates that the receiver receives a packet for the first time and must respond with an ack
+                        self.msgs_received.append(msg["pk_num"])
+                        self.recv_buffer[msg["pk_num"]] = msg
+                        self.handle_recv_buffer()
+                    else:
+                        # indicates that the receiver receives a retransmitted packet suggesting that an ack was lost
+                        # and must be resent
+                        if (self.check_corruption(msg) and msg["pk_num"] in self.msgs_received
+                                and msg["pk_num"] not in self.recv_buffer):
+                            self.send_checksum_ack(msg["pk_num"])
+
+                except OSError:
+                    continue
+                except TypeError:
+                    continue
+                except ValueError:
+                    continue
+
+    def handle_recv_buffer(self):
+        """
+        This handles the receiver's buffer, where it stores messages received until it is able to print the message
+        and respond with the corresponding ack. The message is printed and the receiver responds with the corresponding
+        ack to a packet in order.
+
+        :return: N/A
+        """
+        key_dictionary = self.sort_dic(self.recv_buffer)
+        for i in range(len(self.recv_buffer)):
+            if key_dictionary[0] == self.sequence_number_counter:
+                current_msg = self.recv_buffer.get(key_dictionary[0])
+                print(current_msg["data"], end='', flush=True)
+                self.send_checksum_ack(current_msg["pk_num"])
+                del self.recv_buffer[key_dictionary[0]]
+                self.sequence_number_counter += 1
+                key_dictionary = self.sort_dic(self.recv_buffer)
+            else:
+                return
+
+    def sort_dic(self, dictionary):
+        """ This sorts the given dictionary by its key values.
+
+        :param dictionary: The dictionary to be sorted.
+        :return: An array that contains the sorted dictionary keys.
+        """
+        key_dictionary = list(dictionary)
+        key_dictionary.sort()
+        return key_dictionary
+
+    def check_key_values(self, msg):
+        """ This checks to see if the given JSON msg has the "checksum" key in it.
+
+        :param msg: The JSON msg to be checks.
+        :return: True if there is a "checksum" key in it and False if there is not.
+        """
+        list_of_keys = list(msg.keys())
+        if "checksum" not in list_of_keys:
+            return False
+        else:
+            return True
+
+    def check_corruption(self, msg):
+        """
+        This checks to see if a msg from the Sender is corrupted by comparing the stored checksum with one generated
+        after receiving it from the Sender. The checksum is generated via hashlib's md5 method.
+
+        :param msg: The msg to be checked for corruption.
+        :return: Returns True if it is NOT corrupted and False if it is corrupted.
+        """
+        if not self.check_key_values(msg):
+            return False
+
+        checksum_from_sender = msg["checksum"]
+        del msg["checksum"]
+        msg_string = self.dump_json(msg)
+        checksum_from_receiver = hashlib.md5(msg_string.encode('utf-8')).hexdigest()
+
+        if checksum_from_sender == checksum_from_receiver:
+            msg["checksum"] = checksum_from_sender
+            return True
+        else:
+            return False
+
+    def create_checksum_msg(self, msg):
+        """ This creates a checksum for the given JSON msg.
+
+        :param msg: The Json msg to create a unique checksum value for.
+        :return: The given msg with its checksum stored as "checksum" key value pair.
+        """
+        msg_string = self.dump_json(msg)
+        checksum = hashlib.md5(msg_string.encode('utf-8')).hexdigest()
+        msg["checksum"] = checksum
+        return msg
+
+    def dump_json(self, msg):
+        """ This attempts to dump a given JSON msg into formatted string. If it fails, the program exits.
+
+        :param msg: The JSON msg to be dumped into a formatted string.
+        :return: The JSON msg in a String format.
+        """
+        try:
+            msg_string = json.dumps(msg)
+            return msg_string
+        except OSError:
+            sys.exit()
+        except TypeError:
+            sys.exit()
+        except ValueError:
+            sys.exit()
+
+    def send_checksum_ack(self, packet_number):
+        """ This creates the ack msg and sends it to the Sender (3700send).
+
+        :param packet_number: The packet number for which to send an ack for.
+        :return: N/A
+        """
+        ack_msg = {"pk_num": packet_number}
+        ack_with_checksum = self.create_checksum_msg(ack_msg)
+        self.send(ack_with_checksum)
+
+
+if __name__ == "__main__":
+    # This is the main function on the Receiver's side.
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()
