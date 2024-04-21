@@ -3,6 +3,69 @@
 
 <pre><b> 
 High-level Approach: </b>
+  
+We began this project by reading the project description to understand the requirements. We also looked 
+at the starter code to understand the structure and functionality. We then asked a TA about any initial 
+questions we had before beginning planning our program. For our program, we decided to use Python since 
+we are most familiar with it. We decided to map out our approach in pseudocode first, before fully 
+implementing it.
+
+We agreed that our web crawler program needed to have the functionality to:
+    1. parse the command line input
+    2. establish and maintain a connection to a specific server on a specific port, where the server and 
+       port is set as "proj5.3700.network" and 443 respectively as the default unless otherwise specified 
+       in the command line 
+    3. be able to send HTTP requests and receive and handle HTTP responses to/from a 
+       specific server on a specific port 
+    4. be able login into Fakebook (based on the username and password specified in the command line) 
+       through a GET and POST request and handle their accompanying responses
+    5. traverse all pages in the Fakebook site and inspect them for flags via GET requests and their 
+       responses without accessing the same page more than once via GET requests and their responses
+
+Within these overarching functionalities (described above), we then considered more specific details 
+such as:
+- the format of the GET and POST request for login and the GET request to access pages after logging in
+- the ability to retrieve the csrftoken, sessionid, and/or csrfmiddlewaretoken from a given HTTP response 
+  and update it
+    - ensure the sessionid is up to date in each GET request
+- the ability to handle responses with 200, 302, 403, 404, and 503 status codes by modifying and retrying 
+  the request
+
+After understanding the functionalities needed to be implemented, we played around with the Dev Tools
+to understand HTTP request and HTTP response formats, and take note of how cookies are managed.
+
+When implementing the functionality of the program, we use a TCP socket wrapped in TLS and maintain 
+a connection to a specific server on a specific port using keep-alive. Thus, we handle remaking the 
+connection when broken. We create a GET and POST request to log in properly into Fakebook. We maintain 
+variables for the token, session_id, middlewaretoken so they can be sent as needed with each request. 
+We update them everytime we read a HTTP response. After successfully sending the POST request, we then 
+retrieve the homepage of Fakebook (seen after logging in). This pages gives a list of profiles we can 
+begin to inspect for flags. We decided to use a breadth-first search algorithm to traverse the pages 
+in Fakebook efficiently. Thus, in our code, we maintain two global array data structures: 
+profiles_to_inspect and profiles_already_added. profiles_to_inspect contains URLs of pages that need 
+to be inspected for flags. The first item in the array is inspected and then popped. profiles_already_added 
+maintains an ongoing list of pages already "seen" by our program to ensure a page is not visited twice. 
+Flags are stored in a third global array called flags. We send GET requests for each page we want to 
+inspect, by specifying the URL of the page we are trying to request. When receiving responses, we receive 
+responses until the end of the header if the content-length is 0 or until the closing html tag if it is 
+not 0. We parse the responses. Our program prints the five flags, as they are found, and exits when all 
+five are found. We also check and handle the response status codes through an if/elif structure that 
+checks for the status code and reformats and/or resends the request accordingly, or abandons it entirely. 
+
+We ran the code and ensured that all flags could be found. When we confirmed this was true, we focused on 
+efficiency. Our program was far slower than the 30 minute limit at first, so we first changed how we were 
+parsing responses. Instead of decoding a response, splitting it on spaces, then iterating over it to 
+parse the response and extract the necessary information, we decided to use re.findall() and substring 
+functionality. This made some difference but we knew this was not enough to combat the slowness. So, we 
+decided to implement "connection: keep-alive" functionality so a socket does not have to be opened and 
+closed over and over again. Instead, it only needs to be reopened when the server closes it. We also 
+implemented threading to run 5 parallel requests, each independent of the other in terms of the 
+connection to the server. We made sure to lock where two threads should not access/modify the same 
+thing. 
+
+We continued to test and debug our program throughout the development and finished by also writing this 
+README.md and creating the secret_flags file.
+
 
 </pre><pre><b>Challenges Faced:</b><br>
 
