@@ -1,2 +1,2 @@
 # Projects for Networks and Distributed Systems
-## Project-specific Readmes are in the folders.
+## Project-specific README are in the folders.
