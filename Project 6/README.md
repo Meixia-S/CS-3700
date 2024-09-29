@@ -43,7 +43,7 @@ Handling Elections:
   timer. 
 
 Continuous Background Maintenance:
-  are not relating to elections and directly interacting with clients. While there are no new entries
+  Tasks that are not related to elections and directly interacting with clients. While there are no new entries
   to commit to the log and database, there needs to be some way for the leader to tell the followers it
   is still active and to not start an election. It does this in the form of an empty append 
   entry/heartbeat message. This message doubles as a way to keep follower's logs updated by continuously 
